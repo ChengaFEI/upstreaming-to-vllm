@@ -31,6 +31,8 @@ class NeuronExecutor(ExecutorBase):
             parallel_config=self.parallel_config,
             scheduler_config=self.scheduler_config,
             device_config=self.device_config,
+            load_config=self.load_config,
+            lora_config=self.lora_config,
             cache_config=self.cache_config,
             speculative_config=self.speculative_config,
             local_rank=0,

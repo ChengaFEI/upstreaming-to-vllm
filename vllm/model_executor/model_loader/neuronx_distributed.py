@@ -10,10 +10,20 @@ import torch.nn as nn
 import multiprocessing
 from transformers import AutoModelForCausalLM, PretrainedConfig, AutoTokenizer
 
-from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, SpeculativeConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    LoadConfig,
+    LoRAConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
+from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import (CompletionSequenceGroupOutput, Logprob,
                            SequenceOutput)
@@ -47,6 +57,8 @@ _NEURON_SUPPORTED_MODELS: Dict[str, Tuple[str, str]] = {
                          "NeuronMixtralForCausalLM"),
     "MllamaForConditionalGeneration": ("neuronx_distributed_inference.models.mllama.modeling_mllama",
                          "NeuronMllamaForCausalLM"),
+    "PixtralForConditionalGeneration": ("neuronx_distributed_inference.models.pixtral.modeling_pixtral",
+                                        "NeuronPixtralForCausalLM"),
 }
 
 
@@ -402,6 +414,143 @@ class NeuronSpeculationCasualLM(nn.Module):
         self.model.compile(compiled_model_path)
         self.model.load(compiled_model_path)
 
+
+class NeuronPixtralForCausalLM(nn.Module):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        load_config: LoadConfig,
+        lora_config: LoRAConfig,
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        cache_config: CacheConfig,
+        on_device_sampling_disabled: bool = False) -> None:
+        super().__init__()
+        self.config = model_config.hf_config
+        self.model_config = model_config
+        self.device_config = device_config
+        self.load_config = load_config
+        self.lora_config = lora_config
+        self.parallel_config = parallel_config
+        self.scheduler_config = scheduler_config
+        self.cache_config = cache_config
+        self.logits_processor = LogitsProcessor(self.config.get_text_config().vocab_size,
+                                                logits_as_input=True)
+
+        self.on_device_sampling_disabled = on_device_sampling_disabled
+        if self.on_device_sampling_disabled:
+            # Use default sampler
+            self.sampler = Sampler()
+
+        # Lazy initialized
+        self.model: nn.Module
+
+    def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            input_block_ids: torch.Tensor,
+            sampling_params: torch.Tensor,
+            **kwargs: object,
+        ):
+        output = self.model(
+            input_ids=input_ids,
+            attention_mask=None,
+            position_ids=positions,
+            seq_ids=input_block_ids,
+            sampling_params=sampling_params,
+            **kwargs,
+        )
+        if self.config.neuron_config.on_device_sampling_config:
+            return output.hidden_states
+        return output.logits[:, -1, :]
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                    sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(None, hidden_states, sampling_metadata)
+        return logits
+    
+    def sample(self, hidden_states, sampling_metadata):
+        if not self.on_device_sampling_disabled:
+            with torch.profiler.record_function("sample"):
+                hidden_states = hidden_states.flatten()
+                res = []
+                sample_idx = 0
+                for seq_group in sampling_metadata.seq_groups:
+                    seq_ids = seq_group.seq_ids
+                    samples = []
+                    for seq_id in seq_ids:
+                        token_id = hidden_states[sample_idx].item()
+                        samples.append(SequenceOutput(parent_seq_id=seq_id, output_token=token_id,
+                                                    logprobs={token_id: Logprob(token_id)}))
+                        sample_idx += 1
+                    res.append(CompletionSequenceGroupOutput(samples=samples, prompt_logprobs=None))
+                next_tokens = SamplerOutput(outputs=res)
+        else:
+            next_tokens = self.sampler(None, hidden_states, sampling_metadata)
+        return next_tokens
+
+    def load_weights(self, model_name_or_path: str, **kwargs):
+        arch = _get_model_architecture(self.config)
+        neuronx_module_path, neuronx_model_cls_name = (
+            _NEURON_SUPPORTED_MODELS[arch])
+        neuronx_module = importlib.import_module(neuronx_module_path)
+        neuronx_model_cls = getattr(neuronx_module, neuronx_model_cls_name)
+        neuron_config = neuronx_model_cls.get_neuron_config_cls()(**kwargs['neuron_config'])
+        self.config.neuron_config = neuron_config
+        print(f"neuron_config buckets: {self.config.neuron_config.buckets}")
+        config = neuronx_model_cls.get_config_cls()(
+            neuron_config, load_config=load_pretrained_config(model_name_or_path)
+        )
+        if os.getenv("NEURON_COMPILED_ARTIFACTS") is not None:
+            compiled_model_path = os.getenv("NEURON_COMPILED_ARTIFACTS")
+        elif os.path.exists(model_name_or_path):
+            compiled_model_path = os.path.join(model_name_or_path,
+                f"neuron-compiled-artifacts/{hashlib.md5(config.to_json_string().encode('utf-8')).hexdigest()}/")
+        else:
+            compiled_model_path = os.path.join("local-models", model_name_or_path,
+                f"neuron-compiled-artifacts/{hashlib.md5(config.to_json_string().encode('utf-8')).hexdigest()}/")
+        try:
+            self.model = neuronx_model_cls(compiled_model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            # self.vision_token_id = tokenizer("<|image|>", add_special_tokens=False).input_ids
+            self.model.load(compiled_model_path)
+            return
+        except (FileNotFoundError, ValueError):
+            logger.warning(f"Failed to load the model from {compiled_model_path}, Recompiling...")
+        if not os.path.exists(model_name_or_path):
+            # hf_model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+            # hf_model = get_model(
+            #     model_config=self.model_config,
+            #     load_config=self.load_config,
+            #     device_config=self.device_config,
+            #     parallel_config=self.parallel_config,
+            #     scheduler_config=self.scheduler_config,
+            #     lora_config=self.lora_config,
+            #     cache_config=self.cache_config,
+            # )
+            # saved_path = os.path.join("local-models", model_name_or_path)
+            # hf_model.save_pretrained(saved_path)
+            # model_name_or_path = saved_path
+            pass
+        self.model = neuronx_model_cls(model_name_or_path, config)
+
+        logger.info(f"\nCompiling and saving model to {model_name_or_path}...")
+        p = multiprocessing.Process(target=compile_model, args=(self, compiled_model_path))
+        p.start()
+        p.join()
+
+        # tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        # tokenizer.save_pretrained(compiled_model_path)
+        logger.info(f"successfully compiled and saved the model in {compiled_model_path}")
+
+        # Read "<|image|>" token_id from the tokenizer
+        # self.vision_token_id = tokenizer("<|image|>", add_special_tokens=False).input_ids
+        logger.info("\nLoading model from compiled checkpoint...")
+        self.model.load(compiled_model_path)
+
+
 def _get_model_architecture(config: PretrainedConfig) -> str:
     architectures = getattr(config, "architectures", [])
     for arch in architectures:
@@ -467,12 +616,35 @@ def _get_neuron_config_after_override(default_neuron_config,
 
 def get_neuron_model(model_config: ModelConfig,
                      parallel_config: ParallelConfig,
-                     scheduler_config: SchedulerConfig) -> nn.Module:
+                     scheduler_config: SchedulerConfig,
+                     **kwargs) -> nn.Module:
     model_arch = _get_model_architecture(model_config.hf_config)
+
     if model_arch == "MllamaForConditionalGeneration":
         model = NeuronMllamaForCausalLM(model_config.hf_config)
+
+    elif model_arch == "PixtralForConditionalGeneration":
+        device_config = kwargs.get("device_config", None)
+        assert device_config is not None, "Pixtral requires device_config."
+        cache_config = kwargs.get("cache_config", None)
+        assert cache_config is not None, "Pixtral requires cache_config."
+        load_config = kwargs.get("load_config", None)
+        assert load_config is not None, "Pixtral requires load_config."
+        lora_config = kwargs.get("lora_config", None)
+
+        model = NeuronPixtralForCausalLM(
+            model_config=model_config,
+            device_config=device_config,
+            load_config=load_config,
+            lora_config=lora_config,
+            parallel_config=parallel_config,
+            scheduler_config=scheduler_config,
+            cache_config=cache_config,
+        )
+
     else:
         model = NeuronCasualLM(model_config.hf_config)
+
     default_neuron_config_args = _get_default_neuron_config(
         model_config, parallel_config, scheduler_config)
     neuron_config = _get_neuron_config_after_override(default_neuron_config_args,
