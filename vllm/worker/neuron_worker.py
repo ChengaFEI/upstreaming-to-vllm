@@ -82,11 +82,14 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         local_rank: int,
         rank: int,
         distributed_init_method: str,
+        **kwargs,
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.device_config = device_config
+        self.load_config = kwargs.get("load_config", None)
+        self.lora_config = kwargs.get("lora_config", None)
         self.cache_config = cache_config
         self.speculative_config = speculative_config
         self.local_rank = local_rank
@@ -117,7 +120,14 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                     device_config, speculative_config)
             else:
                 self.model_runner: NeuronxDistributedModelRunner = NeuronxDistributedModelRunner(
-                    model_config, parallel_config, scheduler_config, device_config)
+                    model_config,
+                    parallel_config,
+                    scheduler_config,
+                    device_config,
+                    cache_config=self.cache_config,
+                    load_config=self.load_config,
+                    lora_config=self.lora_config,
+                )
         else:
             raise NotImplementedError(
                 f"Specified framework as {os.environ.get('VLLM_NEURON_FRAMEWORK')}," +

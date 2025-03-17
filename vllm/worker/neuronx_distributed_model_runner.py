@@ -23,14 +23,23 @@ class NeuronxDistributedModelRunner(NeuronModelRunner):
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
+        **kwargs,
     ):
         super().__init__(model_config, parallel_config, scheduler_config, device_config)
+        self.cache_config = kwargs.get("cache_config", None)
+        self.load_config = kwargs.get("load_config", None)
+        self.lora_config = kwargs.get("lora_config", None)
 
     def load_model(self) -> None:
         self.model = get_neuron_model(
             self.model_config,
+            device_config=self.device_config,
             parallel_config=self.parallel_config,
-            scheduler_config=self.scheduler_config)
+            scheduler_config=self.scheduler_config,
+            cache_config=self.cache_config,
+            load_config=self.load_config,
+            lora_config=self.lora_config,
+        )
 
     def get_nxd_sampling_params(self, sampling_metadata):
         if self.model.config.neuron_config.on_device_sampling_config:
@@ -82,10 +91,27 @@ class NeuronxDistributedModelRunner(NeuronModelRunner):
             raise ValueError(
                 "NeuronModelRunner does not support multi-step execution.")
 
-        if not _get_model_architecture(self.model.config) == "MllamaForConditionalGeneration":
-            return super().execute_model(model_input, kv_caches, intermediate_tensors, num_steps)
-
+        model_arch =  _get_model_architecture(self.model.config)
         sampling_params = self.get_nxd_sampling_params(model_input.sampling_metadata)
+
+        # if model_arch == "PixtralForConditionalGeneration":
+        #     hidden_states = self.model(
+        #         input_ids=model_input.input_tokens,
+        #         positions_ids=model_input.input_positions,
+        #         seq_ids=model_input.input_block_ids,
+        #         sampling_params=sampling_params,
+        #         images=model_input.multi_modal_kwargs.get("image", None),
+        #     )
+
+        #     output = self.model.sample(
+        #         hidden_states=hidden_states,
+        #         sampling_metadata=model_input.sampling_metadata,
+        #     )
+
+        #     return [output]
+
+        if not model_arch == "MllamaForConditionalGeneration":
+            return super().execute_model(model_input, kv_caches, intermediate_tensors, num_steps)
 
         if model_input.multi_modal_kwargs.get('image') is not None:
             pixel_values = []

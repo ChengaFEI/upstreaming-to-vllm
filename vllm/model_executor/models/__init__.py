@@ -1,5 +1,6 @@
 import functools
 import importlib
+import os
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch.nn as nn
@@ -151,9 +152,15 @@ class ModelRegistry:
     @staticmethod
     @functools.lru_cache(maxsize=128)
     def _get_model(model_arch: str):
-        module_name, model_cls_name = _MODELS[model_arch]
-        module = importlib.import_module(
-            f"vllm.model_executor.models.{module_name}")
+        vllm_neuron_framework = os.environ.get("VLLM_NEURON_FRAMEWORK", None)
+        if vllm_neuron_framework is not None and model_arch == "PixtralForConditionalGeneration":
+            module_name = "neuronx_distributed_inference.models.pixtral.modeling_pixtral"
+            model_cls_name = "NeuronPixtralForCausalLM"
+            module = importlib.import_module(module_name)
+        else:
+            module_name, model_cls_name = _MODELS[model_arch]
+            module = importlib.import_module(
+                f"vllm.model_executor.models.{module_name}")
         return getattr(module, model_cls_name, None)
 
     @staticmethod
