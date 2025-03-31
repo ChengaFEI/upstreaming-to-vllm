@@ -513,7 +513,7 @@ class NeuronPixtralForCausalLM(nn.Module):
                 f"neuron-compiled-artifacts/{hashlib.md5(config.to_json_string().encode('utf-8')).hexdigest()}/")
         try:
             self.model = neuronx_model_cls(compiled_model_path)
-            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            # tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
             # self.vision_token_id = tokenizer("<|image|>", add_special_tokens=False).input_ids
             self.model.load(compiled_model_path)
             return
